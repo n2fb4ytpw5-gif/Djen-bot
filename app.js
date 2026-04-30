@@ -30,28 +30,33 @@ function saveSeen(set) {
 
 // ─── CONSULTA DATAJUD ─────────────────────────────────────────────────────────
 async function fetchPublications() {
-  // URL Nacional para evitar quedas de tribunais específicos
-  const url = `https://api-publica.datajud.cnj.jus.br/api_publica_public/_search`;
-
+  // Tentamos primeiro o TJRS, que é o seu tribunal principal
+  let url = `https://api-publica.datajud.cnj.jus.br/api_publica_tjrs/_search`;
+  
   const queryData = {
     "query": {
-      "bool": {
-        "must": [
-          { "match": { "advogado.numero_oab": OAB_NUM } },
-          { "match": { "advogado.uf": OAB_UF } }
-        ]
-      }
-    }
+      "match": { "advogado.numero_oab": OAB_NUM }
+    },
+    "_source": ["numeroProcesso", "dataHoraUltimaAtualizacao", "tribunal", "classe.nome"]
+  };
+
+  const config = {
+    headers: {
+      'Authorization': `ApiKey ${API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: 25000
   };
 
   try {
-    const response = await axios.post(url, queryData, {
-      headers: {
-        'Authorization': `ApiKey ${API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 25000
-    });
+    let response = await axios.post(url, queryData, config);
+    
+    // Se a busca retornar vazia ou der erro, tentamos a base Nacional (Fallback)
+    if (!response.data?.hits?.hits?.length) {
+      console.log('[DataJud] Sem resultados no TJRS, tentando base Nacional...');
+      url = `https://api-publica.datajud.cnj.jus.br/api_publica_public/_search`;
+      response = await axios.post(url, queryData, config);
+    }
 
     const items = response.data?.hits?.hits || [];
     return items.map(item => ({
@@ -62,24 +67,35 @@ async function fetchPublications() {
       resumo: item._source.classe?.nome || "Movimentação detectada"
     }));
   } catch (err) {
-    console.error('[DataJud] Detalhe do Erro:', err.response?.status || err.message);
-    return null; 
+    const status = err.response?.status;
+    console.error(`[DataJud] Erro ${status}:`, err.message);
+    return status || "ERRO"; 
   }
 }
 
 // ─── LÓGICA DE ENVIO ──────────────────────────────────────────────────────────
 async function checkPublications() {
-  console.log(`[${new Date().toLocaleString('pt-BR')}] Verificando...`);
+  console.log(`[${new Date().toLocaleString('pt-BR')}] Verificando publicações...`);
   const seen = loadSeen();
   const pubs = await fetchPublications();
 
-  if (pubs === null) {
-    await bot.sendMessage(CHAT_ID, "⚠️ *Erro 401/Conexão:* O DataJud recusou a chave de acesso. Verifique a variável DATAJUD_API_KEY no Railway.");
+  if (pubs === 401) {
+    await bot.sendMessage(CHAT_ID, "🔐 *Erro 401:* Chave de acesso recusada. Verifique a `DATAJUD_API_KEY` no Railway.");
+    return;
+  }
+  
+  if (pubs === 404) {
+    await bot.sendMessage(CHAT_ID, "🚫 *Erro 404:* Servidor do tribunal não encontrado. Tentarei novamente na próxima hora.");
+    return;
+  }
+
+  if (typeof pubs === 'string') {
+    await bot.sendMessage(CHAT_ID, "⚠️ *Erro de Conexão:* O DataJud está instável no momento.");
     return;
   }
 
   if (pubs.length === 0) {
-    await bot.sendMessage(CHAT_ID, `🔍 *Verificação:* Nenhum processo encontrado para OAB ${OAB_NUM}/${OAB_UF}.`);
+    await bot.sendMessage(CHAT_ID, `🔍 *Verificação:* Nenhum processo encontrado para OAB ${OAB_NUM}.`);
     return;
   }
 
@@ -99,7 +115,7 @@ async function checkPublications() {
   }
 
   if (novos === 0) {
-    await bot.sendMessage(CHAT_ID, `✅ *Status:* Tudo em dia. Nenhuma nova atualização na última hora.`);
+    await bot.sendMessage(CHAT_ID, `✅ *Status:* Tudo em dia. Nenhuma movimentação nova para a OAB ${OAB_NUM}.`);
   }
 
   saveSeen(seen);
@@ -109,11 +125,11 @@ async function checkPublications() {
 bot.onText(/\/verificar/, () => checkPublications());
 
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, `🚀 *Bot OAB ${OAB_NUM} Online*\nVerificações de hora em hora ativadas.`);
+  bot.sendMessage(msg.chat.id, `🚀 *Bot OAB ${OAB_NUM} Online*\n\nVerificações automáticas a cada 1 hora.\nUse /verificar para buscar agora.`);
 });
 
 // Agendamento: minuto 0 de cada hora
 cron.schedule('0 * * * *', checkPublications);
 
-// Executa ao iniciar
+// Executa uma vez ao iniciar o servidor
 checkPublications();
