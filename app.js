@@ -6,11 +6,11 @@ const fs = require('fs');
 // ─── CONFIGURAÇÃO ─────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
-const OAB_NUM   = process.env.OAB_NUMBER;   // No Railway deve ser: 139219
-const OAB_UF    = process.env.OAB_UF;       // No Railway deve ser: RS
+const OAB_NUM   = process.env.OAB_NUMBER;   
+const OAB_UF    = process.env.OAB_UF;       
+const API_KEY   = process.env.DATAJUD_API_KEY || 'c3VwZXJzZWNyZXRvOnN1cGVyc2VjcmV0bw==';
 
 const SEEN_FILE = './seen_ids.json';
-
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 // ─── PERSISTÊNCIA ─────────────────────────────────────────────────────────────
@@ -20,45 +20,38 @@ function loadSeen() {
       return new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
     }
     return new Set();
-  } catch (err) {
-    return new Set();
-  }
+  } catch (err) { return new Set(); }
 }
 
 function saveSeen(set) {
-  try {
-    fs.writeFileSync(SEEN_FILE, JSON.stringify([...set]));
-  } catch (err) {
-    console.error('Erro ao salvar visto:', err.message);
-  }
+  try { fs.writeFileSync(SEEN_FILE, JSON.stringify([...set])); } 
+  catch (err) { console.error('Erro ao salvar cache:', err.message); }
 }
 
-// ─── CONSULTA DATAJUD (CNJ) ───────────────────────────────────────────────────
+// ─── CONSULTA DATAJUD ─────────────────────────────────────────────────────────
 async function fetchPublications() {
-  // Usando a URL pública nacional para maior estabilidade
+  // URL Nacional para evitar quedas de tribunais específicos
   const url = `https://api-publica.datajud.cnj.jus.br/api_publica_public/_search`;
 
-  try {
-    const response = await axios.post(
-      url,
-      {
-        "query": {
-          "bool": {
-            "must": [
-              { "match": { "advogado.numero_oab": OAB_NUM } },
-              { "match": { "advogado.uf": OAB_UF } }
-            ]
-          }
-        }
-      },
-      {
-        headers: {
-          'Authorization': 'ApiKey c3VwZXJzZWNyZXRvOnN1cGVyc2VjcmV0bw==',
-          'Content-Type': 'application/json'
-        },
-        timeout: 20000
+  const queryData = {
+    "query": {
+      "bool": {
+        "must": [
+          { "match": { "advogado.numero_oab": OAB_NUM } },
+          { "match": { "advogado.uf": OAB_UF } }
+        ]
       }
-    );
+    }
+  };
+
+  try {
+    const response = await axios.post(url, queryData, {
+      headers: {
+        'Authorization': `ApiKey ${API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 25000
+    });
 
     const items = response.data?.hits?.hits || [];
     return items.map(item => ({
@@ -66,84 +59,61 @@ async function fetchPublications() {
       numeroProcesso: item._source.numeroProcesso,
       data: item._source.dataHoraUltimaAtualizacao,
       tribunal: item._source.tribunal,
-      classe: item._source.classe?.nome || "Movimentação Processual"
+      resumo: item._source.classe?.nome || "Movimentação detectada"
     }));
   } catch (err) {
-    console.error('[DataJud] Erro na consulta:', err.message);
+    console.error('[DataJud] Detalhe do Erro:', err.response?.status || err.message);
     return null; 
   }
 }
 
-// ─── FORMATAÇÃO ───────────────────────────────────────────────────────────────
-function formatMsg(pub) {
-  const data = new Date(pub.data).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
-  
-  return (
-    `⚖️ *Nova atualização localizada*\n\n` +
-    `📋 *Processo:* \`${pub.numeroProcesso}\`\n` +
-    `🏛️ *Tribunal:* ${pub.tribunal}\n` +
-    `📅 *Data:* ${data}\n\n` +
-    `📝 *Descrição:* ${pub.classe}`
-  );
-}
-
-// ─── LÓGICA DE VERIFICAÇÃO ────────────────────────────────────────────────────
+// ─── LÓGICA DE ENVIO ──────────────────────────────────────────────────────────
 async function checkPublications() {
-  console.log(`[${new Date().toLocaleString('pt-BR')}] Iniciando checagem...`);
+  console.log(`[${new Date().toLocaleString('pt-BR')}] Verificando...`);
   const seen = loadSeen();
   const pubs = await fetchPublications();
 
-  // Caso ocorra erro de conexão/autenticação
   if (pubs === null) {
-    await bot.sendMessage(CHAT_ID, "⚠️ *Aviso:* Falha na conexão com o DataJud. Verificarei novamente na próxima hora.");
+    await bot.sendMessage(CHAT_ID, "⚠️ *Erro 401/Conexão:* O DataJud recusou a chave de acesso. Verifique a variável DATAJUD_API_KEY no Railway.");
     return;
   }
 
-  // Caso não existam processos para essa OAB
   if (pubs.length === 0) {
-    await bot.sendMessage(CHAT_ID, "🔍 *Verificação:* Nenhum processo ou prazo em aberto localizado para OAB " + OAB_NUM + ".");
+    await bot.sendMessage(CHAT_ID, `🔍 *Verificação:* Nenhum processo encontrado para OAB ${OAB_NUM}/${OAB_UF}.`);
     return;
   }
 
-  let novosEnviados = 0;
+  let novos = 0;
   for (const pub of pubs) {
     if (seen.has(pub.id)) continue;
-
     seen.add(pub.id);
-    novosEnviados++;
+    novos++;
 
-    try {
-      await bot.sendMessage(CHAT_ID, formatMsg(pub), { parse_mode: 'Markdown' });
-    } catch (e) {
-      console.error('[Telegram] Erro ao enviar:', e.message);
-    }
+    const msg = `⚖️ *Nova Movimentação*\n\n` +
+                `📋 *Processo:* \`${pub.numeroProcesso}\`\n` +
+                `🏛️ *Tribunal:* ${pub.tribunal}\n` +
+                `📅 *Data:* ${new Date(pub.data).toLocaleString('pt-BR')}\n` +
+                `📝 *Classe:* ${pub.resumo}`;
+
+    await bot.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
   }
 
-  // Se a lista não estiver vazia, mas todos já foram vistos
-  if (novosEnviados === 0) {
-    await bot.sendMessage(CHAT_ID, "✅ *Tudo em dia:* Nenhuma movimentação nova para a OAB " + OAB_NUM + ".");
+  if (novos === 0) {
+    await bot.sendMessage(CHAT_ID, `✅ *Status:* Tudo em dia. Nenhuma nova atualização na última hora.`);
   }
 
   saveSeen(seen);
 }
 
-// ─── COMANDOS ─────────────────────────────────────────────────────────────────
+// ─── COMANDOS E AGENDAMENTO ───────────────────────────────────────────────────
+bot.onText(/\/verificar/, () => checkPublications());
+
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, `🤖 *Monitor Jurídico Ativo*\n\nMonitorando OAB *${OAB_NUM}/${OAB_UF}*.\nVerificações automáticas de hora em hora.`);
+  bot.sendMessage(msg.chat.id, `🚀 *Bot OAB ${OAB_NUM} Online*\nVerificações de hora em hora ativadas.`);
 });
 
-bot.onText(/\/verificar/, async (msg) => {
-  await bot.sendMessage(msg.chat.id, '🔎 Iniciando busca manual...');
-  await checkPublications();
-});
-
-bot.onText(/\/status/, (msg) => {
-  bot.sendMessage(msg.chat.id, `⚙️ *Configuração*\nOAB: ${OAB_NUM}\nUF: ${OAB_UF}\nFrequência: 1h/1h`);
-});
-
-// ─── AGENDAMENTO (Hora em Hora) ───────────────────────────────────────────────
+// Agendamento: minuto 0 de cada hora
 cron.schedule('0 * * * *', checkPublications);
 
-// ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
-console.log('🤖 Bot iniciado com sucesso!');
-checkPublications(); 
+// Executa ao iniciar
+checkPublications();
