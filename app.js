@@ -164,3 +164,4 @@ cron.schedule('0 * * * *', checkPublications);
 // ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
 console.log("Bot iniciado...");
 checkPublications();
+bot.sendMessage(CHAT_ID, "🚨 TESTE: bot iniciou");
