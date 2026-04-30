@@ -1,188 +1,185 @@
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-const cron = require('node-cron');
 const fs = require('fs');
+const cron = require('node-cron');
 
-// ─── CONFIGURAÇÃO ─────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
-const OAB_NUM   = process.env.OAB_NUMBER;
-const API_KEY   = process.env.DATAJUD_API_KEY;
 
-if (!BOT_TOKEN || !CHAT_ID || !OAB_NUM || !API_KEY) {
-  throw new Error("❌ Variáveis de ambiente obrigatórias não definidas.");
-}
+if (!BOT_TOKEN) throw new Error("Token não definido");
 
-const SEEN_FILE = './seen_ids.json';
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: {
-    interval: 300,
-    autoStart: true,
-    params: { timeout: 10 }
-  }
-});
+// ─── ARQUIVOS ─────────────────────────────────────────────────
+const CLIENTES_FILE = './clientes.json';
+const FINANCEIRO_FILE = './financeiro.json';
+const PRAZOS_FILE = './prazos.json';
 
-// ─── PERSISTÊNCIA ─────────────────────────────────────────────────────────────
-function loadSeen() {
+// ─── FUNÇÕES AUXILIARES ───────────────────────────────────────
+function load(file) {
   try {
-    if (fs.existsSync(SEEN_FILE)) {
-      return new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file));
     }
-    return new Set();
+    return [];
   } catch {
-    return new Set();
+    return [];
   }
 }
 
-function saveSeen(set) {
-  try {
-    fs.writeFileSync(SEEN_FILE, JSON.stringify([...set]));
-  } catch (err) {
-    console.error("Erro ao salvar cache:", err.message);
-  }
+function save(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-// ─── CONSULTA DATAJUD ─────────────────────────────────────────────────────────
-async function fetchPublications() {
+// ─── 1. CRM DE CLIENTES ───────────────────────────────────────
+bot.onText(/\/cliente novo (.+)/, (msg, match) => {
+  const [nome, telefone, processo] = match[1].split('|');
 
-  const urls = [
-    `https://api-publica.datajud.cnj.jus.br/api_publica_tjrs/_search`,
-    `https://api-publica.datajud.cnj.jus.br/api_publica_public/_search`
-  ];
+  const clientes = load(CLIENTES_FILE);
 
-  const queryData = {
-    query: {
-      bool: {
-        must: [
-          {
-            range: {
-              dataHoraUltimaAtualizacao: {
-                gte: "now-3d"
-              }
-            }
-          }
-        ],
-        should: [
-          {
-            query_string: {
-              query: `"${OAB_NUM}" OR ${OAB_NUM}`
-            }
-          }
-        ]
-      }
-    },
-    _source: [
-      "numeroProcesso",
-      "dataHoraUltimaAtualizacao",
-      "tribunal",
-      "classe.nome"
-    ],
-    size: 20
-  };
+  clientes.push({
+    nome: nome.trim(),
+    telefone: telefone?.trim(),
+    processo: processo?.trim(),
+    criadoEm: new Date()
+  });
 
-  const config = {
-    headers: {
-      Authorization: `ApiKey ${API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    timeout: 20000
-  };
+  save(CLIENTES_FILE, clientes);
 
-  for (const url of urls) {
-    try {
-      console.log("🔎 Consultando:", url);
+  bot.sendMessage(msg.chat.id, "✅ Cliente cadastrado");
+});
 
-      const response = await axios.post(url, queryData, config);
+bot.onText(/\/cliente listar/, (msg) => {
+  const clientes = load(CLIENTES_FILE);
 
-      const items = response.data?.hits?.hits || [];
+  if (clientes.length === 0) {
+    return bot.sendMessage(msg.chat.id, "Nenhum cliente cadastrado.");
+  }
 
-      console.log("📊 Total encontrados:", items.length);
+  let texto = "📋 Clientes:\n\n";
 
-      return items.map(item => ({
-        id: item._id,
-        numeroProcesso: item._source.numeroProcesso,
-        data: item._source.dataHoraUltimaAtualizacao,
-        tribunal: item._source.tribunal,
-        resumo: item._source.classe?.nome || "Movimentação detectada"
-      }));
+  clientes.forEach(c => {
+    texto += `• ${c.nome} | ${c.processo || "sem processo"}\n`;
+  });
 
-    } catch (err) {
-      console.error("Erro DataJud:", err.response?.status, err.message);
+  bot.sendMessage(msg.chat.id, texto);
+});
+
+// ─── 2. CONTROLE FINANCEIRO ───────────────────────────────────
+bot.onText(/\/recebi (\d+) (.+)/, (msg, match) => {
+  const valor = parseFloat(match[1]);
+  const cliente = match[2];
+
+  const dados = load(FINANCEIRO_FILE);
+
+  dados.push({
+    tipo: "entrada",
+    valor,
+    cliente,
+    data: new Date()
+  });
+
+  save(FINANCEIRO_FILE, dados);
+
+  bot.sendMessage(msg.chat.id, "💰 Entrada registrada");
+});
+
+bot.onText(/\/gasto (\d+) (.+)/, (msg, match) => {
+  const valor = parseFloat(match[1]);
+  const descricao = match[2];
+
+  const dados = load(FINANCEIRO_FILE);
+
+  dados.push({
+    tipo: "gasto",
+    valor,
+    descricao,
+    data: new Date()
+  });
+
+  save(FINANCEIRO_FILE, dados);
+
+  bot.sendMessage(msg.chat.id, "💸 Gasto registrado");
+});
+
+bot.onText(/\/resumo/, (msg) => {
+  const dados = load(FINANCEIRO_FILE);
+
+  let entrada = 0;
+  let gasto = 0;
+
+  dados.forEach(d => {
+    if (d.tipo === "entrada") entrada += d.valor;
+    if (d.tipo === "gasto") gasto += d.valor;
+  });
+
+  const saldo = entrada - gasto;
+
+  bot.sendMessage(msg.chat.id,
+    `📊 Resumo:\n\n` +
+    `Entradas: R$ ${entrada}\n` +
+    `Gastos: R$ ${gasto}\n` +
+    `Saldo: R$ ${saldo}`
+  );
+});
+
+// ─── 3. PRAZOS ────────────────────────────────────────────────
+bot.onText(/\/prazo (\d{2}\/\d{2}\/\d{4}) (.+)/, (msg, match) => {
+  const data = match[1];
+  const desc = match[2];
+
+  const prazos = load(PRAZOS_FILE);
+
+  prazos.push({ data, desc });
+
+  save(PRAZOS_FILE, prazos);
+
+  bot.sendMessage(msg.chat.id, "📅 Prazo salvo");
+});
+
+// Verificação diária
+cron.schedule('0 9 * * *', () => {
+  const hoje = new Date().toLocaleDateString('pt-BR');
+  const prazos = load(PRAZOS_FILE);
+
+  prazos.forEach(p => {
+    if (p.data === hoje) {
+      bot.sendMessage(process.env.TELEGRAM_CHAT_ID,
+        `⏰ Prazo hoje:\n${p.desc}`
+      );
     }
-  }
-
-  return "ERRO_GERAL";
-}
-
-// ─── LÓGICA DE ENVIO ──────────────────────────────────────────────────────────
-async function checkPublications() {
-  console.log("⏱️ Verificando publicações...");
-
-  const seen = loadSeen();
-  const pubs = await fetchPublications();
-
-  if (pubs === "ERRO_GERAL") {
-    await bot.sendMessage(CHAT_ID, "⚠️ Erro ao consultar DataJud.");
-    return;
-  }
-
-  await bot.sendMessage(CHAT_ID, `🔍 Debug: ${pubs.length} resultados encontrados`);
-
-  if (pubs.length === 0) return;
-
-  let novos = 0;
-
-  for (const pub of pubs) {
-    if (seen.has(pub.id)) continue;
-
-    seen.add(pub.id);
-    novos++;
-
-    const msg =
-      `⚖️ *Nova Movimentação*\n\n` +
-      `📋 *Processo:* \`${pub.numeroProcesso}\`\n` +
-      `🏛️ *Tribunal:* ${pub.tribunal}\n` +
-      `📅 *Data:* ${new Date(pub.data).toLocaleString('pt-BR')}\n` +
-      `📝 *Classe:* ${pub.resumo}`;
-
-    try {
-      await bot.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-    } catch (err) {
-      console.error("Erro ao enviar mensagem:", err.message);
-    }
-  }
-
-  console.log(`📨 Novos enviados: ${novos}`);
-
-  saveSeen(seen);
-}
-
-// ─── COMANDOS ─────────────────────────────────────────────────────────────────
-bot.onText(/\/verificar/, () => checkPublications());
-
-bot.onText(/\/start/, (m) => {
-  bot.sendMessage(m.chat.id, `🤖 Bot ativo!\nOAB monitorada: ${OAB_NUM}`);
+  });
 });
 
-// ─── SEGURANÇA (ANTI-TRAVAMENTO) ──────────────────────────────────────────────
-process.on('unhandledRejection', (err) => {
-  console.error("Erro não tratado:", err);
+// ─── 4. RESPOSTAS AUTOMÁTICAS ─────────────────────────────────
+bot.onText(/\/acordo/, (msg) => {
+  bot.sendMessage(msg.chat.id,
+    `Boa tarde!\n\nSegue proposta de acordo conforme conversado.`
+  );
 });
 
-process.on('uncaughtException', (err) => {
-  console.error("Exceção:", err);
+// ─── 5. CONSULTA BÁSICA DE PROCESSO ───────────────────────────
+bot.onText(/\/processo (.+)/, (msg, match) => {
+  const numero = match[1];
+
+  if (numero.length < 10) {
+    return bot.sendMessage(msg.chat.id, "❌ Número inválido");
+  }
+
+  let tribunal = "Desconhecido";
+
+  if (numero.includes("8.21")) tribunal = "TJRS";
+  if (numero.includes("8.26")) tribunal = "TJSP";
+
+  bot.sendMessage(msg.chat.id,
+    `🔎 Consulta básica:\n\n` +
+    `Processo: ${numero}\n` +
+    `Tribunal: ${tribunal}\n\n` +
+    `⚠️ Consulta completa ainda não integrada`
+  );
 });
 
-// ─── KEEP ALIVE (IMPORTANTE NO RAILWAY) ───────────────────────────────────────
-setInterval(() => {
-  console.log("🟢 Bot ativo:", new Date().toLocaleTimeString());
-}, 60000);
+// ─── START ────────────────────────────────────────────────────
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id, "🤖 Bot jurídico ativo!");
+});
 
-// ─── AGENDAMENTO ──────────────────────────────────────────────────────────────
-cron.schedule('0 * * * *', checkPublications);
-
-// ─── START ────────────────────────────────────────────────────────────────────
-console.log("🚀 Bot iniciado...");
-bot.sendMessage(CHAT_ID, "🚨 Bot reiniciado e rodando!");
-checkPublications();
+console.log("🚀 Bot rodando...");
