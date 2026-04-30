@@ -9,13 +9,19 @@ const CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const OAB_NUM   = process.env.OAB_NUMBER;
 const API_KEY   = process.env.DATAJUD_API_KEY;
 
-// Validação obrigatória
 if (!BOT_TOKEN || !CHAT_ID || !OAB_NUM || !API_KEY) {
   throw new Error("❌ Variáveis de ambiente obrigatórias não definidas.");
 }
 
 const SEEN_FILE = './seen_ids.json';
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: { timeout: 10 }
+  }
+});
 
 // ─── PERSISTÊNCIA ─────────────────────────────────────────────────────────────
 function loadSeen() {
@@ -24,8 +30,7 @@ function loadSeen() {
       return new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
     }
     return new Set();
-  } catch (err) {
-    console.error("Erro ao carregar cache:", err.message);
+  } catch {
     return new Set();
   }
 }
@@ -34,12 +39,13 @@ function saveSeen(set) {
   try {
     fs.writeFileSync(SEEN_FILE, JSON.stringify([...set]));
   } catch (err) {
-    console.error('Erro ao salvar cache:', err.message);
+    console.error("Erro ao salvar cache:", err.message);
   }
 }
 
 // ─── CONSULTA DATAJUD ─────────────────────────────────────────────────────────
 async function fetchPublications() {
+
   const urls = [
     `https://api-publica.datajud.cnj.jus.br/api_publica_tjrs/_search`,
     `https://api-publica.datajud.cnj.jus.br/api_publica_public/_search`
@@ -52,14 +58,17 @@ async function fetchPublications() {
           {
             range: {
               dataHoraUltimaAtualizacao: {
-                gte: "now-1d"
+                gte: "now-3d"
               }
             }
           }
         ],
         should: [
-          { match: { "advogados.numero_oab": OAB_NUM } },
-          { match: { "advogados.numeroOAB": OAB_NUM } }
+          {
+            query_string: {
+              query: `"${OAB_NUM}" OR ${OAB_NUM}`
+            }
+          }
         ]
       }
     },
@@ -82,14 +91,13 @@ async function fetchPublications() {
 
   for (const url of urls) {
     try {
-      console.log(`[DataJud] Consultando: ${url}`);
+      console.log("🔎 Consultando:", url);
 
       const response = await axios.post(url, queryData, config);
 
-      console.log("[DEBUG] Status:", response.status);
-      console.log("[DEBUG] Total hits:", response.data?.hits?.total?.value);
-
       const items = response.data?.hits?.hits || [];
+
+      console.log("📊 Total encontrados:", items.length);
 
       return items.map(item => ({
         id: item._id,
@@ -100,7 +108,7 @@ async function fetchPublications() {
       }));
 
     } catch (err) {
-      console.error(`[DataJud] Erro:`, err.response?.status, err.response?.data || err.message);
+      console.error("Erro DataJud:", err.response?.status, err.message);
     }
   }
 
@@ -109,20 +117,19 @@ async function fetchPublications() {
 
 // ─── LÓGICA DE ENVIO ──────────────────────────────────────────────────────────
 async function checkPublications() {
-  console.log(`[${new Date().toLocaleString('pt-BR')}] Verificando...`);
+  console.log("⏱️ Verificando publicações...");
 
   const seen = loadSeen();
   const pubs = await fetchPublications();
 
   if (pubs === "ERRO_GERAL") {
-    await bot.sendMessage(CHAT_ID, "⚠️ DataJud indisponível. Tentarei novamente.");
+    await bot.sendMessage(CHAT_ID, "⚠️ Erro ao consultar DataJud.");
     return;
   }
 
-  if (pubs.length === 0) {
-    console.log("Nenhum resultado encontrado.");
-    return;
-  }
+  await bot.sendMessage(CHAT_ID, `🔍 Debug: ${pubs.length} resultados encontrados`);
+
+  if (pubs.length === 0) return;
 
   let novos = 0;
 
@@ -139,14 +146,14 @@ async function checkPublications() {
       `📅 *Data:* ${new Date(pub.data).toLocaleString('pt-BR')}\n` +
       `📝 *Classe:* ${pub.resumo}`;
 
-    await bot.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+    try {
+      await bot.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error("Erro ao enviar mensagem:", err.message);
+    }
   }
 
-  if (novos === 0) {
-    console.log("Sem novidades.");
-  } else {
-    console.log(`Enviados ${novos} novos processos.`);
-  }
+  console.log(`📨 Novos enviados: ${novos}`);
 
   saveSeen(seen);
 }
@@ -155,13 +162,27 @@ async function checkPublications() {
 bot.onText(/\/verificar/, () => checkPublications());
 
 bot.onText(/\/start/, (m) => {
-  bot.sendMessage(m.chat.id, `🤖 Bot online!\nMonitorando OAB: ${OAB_NUM}`);
+  bot.sendMessage(m.chat.id, `🤖 Bot ativo!\nOAB monitorada: ${OAB_NUM}`);
 });
+
+// ─── SEGURANÇA (ANTI-TRAVAMENTO) ──────────────────────────────────────────────
+process.on('unhandledRejection', (err) => {
+  console.error("Erro não tratado:", err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error("Exceção:", err);
+});
+
+// ─── KEEP ALIVE (IMPORTANTE NO RAILWAY) ───────────────────────────────────────
+setInterval(() => {
+  console.log("🟢 Bot ativo:", new Date().toLocaleTimeString());
+}, 60000);
 
 // ─── AGENDAMENTO ──────────────────────────────────────────────────────────────
 cron.schedule('0 * * * *', checkPublications);
 
-// ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
-console.log("Bot iniciado...");
+// ─── START ────────────────────────────────────────────────────────────────────
+console.log("🚀 Bot iniciado...");
+bot.sendMessage(CHAT_ID, "🚨 Bot reiniciado e rodando!");
 checkPublications();
-bot.sendMessage(CHAT_ID, "🚨 TESTE: bot iniciou");
