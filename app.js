@@ -3,11 +3,11 @@ const axios = require('axios');
 const cron = require('node-cron');
 const fs = require('fs');
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
+// ─── CONFIGURAÇÃO ─────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
-const OAB_NUM   = process.env.OAB_NUMBER;   // ex: "139219"
-const OAB_UF    = process.env.OAB_UF;       // ex: "RS"
+const OAB_NUM   = process.env.OAB_NUMBER;   // No Railway deve ser: 139219
+const OAB_UF    = process.env.OAB_UF;       // No Railway deve ser: RS
 
 const SEEN_FILE = './seen_ids.json';
 
@@ -16,27 +16,38 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 // ─── PERSISTÊNCIA ─────────────────────────────────────────────────────────────
 function loadSeen() {
   try {
-    return new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
-  } catch {
+    if (fs.existsSync(SEEN_FILE)) {
+      return new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
+    }
+    return new Set();
+  } catch (err) {
     return new Set();
   }
 }
 
 function saveSeen(set) {
-  fs.writeFileSync(SEEN_FILE, JSON.stringify([...set]));
+  try {
+    fs.writeFileSync(SEEN_FILE, JSON.stringify([...set]));
+  } catch (err) {
+    console.error('Erro ao salvar visto:', err.message);
+  }
 }
 
 // ─── CONSULTA DATAJUD (CNJ) ───────────────────────────────────────────────────
 async function fetchPublications() {
-  const url = `https://api-publica.datajud.cnj.jus.br/api_publica_tjrs/_search`;
+  // Usando a URL pública nacional para maior estabilidade
+  const url = `https://api-publica.datajud.cnj.jus.br/api_publica_public/_search`;
 
   try {
     const response = await axios.post(
       url,
       {
         "query": {
-          "match": {
-            "advogado.numero_oab": OAB_NUM
+          "bool": {
+            "must": [
+              { "match": { "advogado.numero_oab": OAB_NUM } },
+              { "match": { "advogado.uf": OAB_UF } }
+            ]
           }
         }
       },
@@ -45,52 +56,52 @@ async function fetchPublications() {
           'Authorization': 'ApiKey c3VwZXJzZWNyZXRvOnN1cGVyc2VjcmV0bw==',
           'Content-Type': 'application/json'
         },
-        timeout: 15000
+        timeout: 20000
       }
     );
 
     const items = response.data?.hits?.hits || [];
     return items.map(item => ({
-      id: item._id, // Usamos o ID único do DataJud
+      id: item._id,
       numeroProcesso: item._source.numeroProcesso,
       data: item._source.dataHoraUltimaAtualizacao,
-      texto: item._source.classe?.nome || "Movimentação processual identificada no TJRS."
+      tribunal: item._source.tribunal,
+      classe: item._source.classe?.nome || "Movimentação Processual"
     }));
   } catch (err) {
     console.error('[DataJud] Erro na consulta:', err.message);
-    return null; // Retorna null para indicar erro de conexão
+    return null; 
   }
 }
 
 // ─── FORMATAÇÃO ───────────────────────────────────────────────────────────────
 function formatMsg(pub) {
-  const num = pub.numeroProcesso;
-  const data = new Date(pub.data).toLocaleString('pt-BR');
-  const texto = pub.texto;
-
+  const data = new Date(pub.data).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+  
   return (
-    `⚖️ *Nova publicação detectada*\n\n` +
-    `📋 *Processo:* \`${num}\`\n` +
-    `📅 *Atualização:* ${data}\n\n` +
-    `📝 *Classe/Movimentação:*\n${texto}`
+    `⚖️ *Nova atualização localizada*\n\n` +
+    `📋 *Processo:* \`${pub.numeroProcesso}\`\n` +
+    `🏛️ *Tribunal:* ${pub.tribunal}\n` +
+    `📅 *Data:* ${data}\n\n` +
+    `📝 *Descrição:* ${pub.classe}`
   );
 }
 
 // ─── LÓGICA DE VERIFICAÇÃO ────────────────────────────────────────────────────
 async function checkPublications() {
-  console.log(`[${new Date().toLocaleString('pt-BR')}] Iniciando verificação horária...`);
+  console.log(`[${new Date().toLocaleString('pt-BR')}] Iniciando checagem...`);
   const seen = loadSeen();
   const pubs = await fetchPublications();
 
-  // Se a API falhar (retornar null)
+  // Caso ocorra erro de conexão/autenticação
   if (pubs === null) {
-    await bot.sendMessage(CHAT_ID, "⚠️ *Aviso:* Falha na conexão com o DataJud. Tentarei novamente na próxima hora.");
+    await bot.sendMessage(CHAT_ID, "⚠️ *Aviso:* Falha na conexão com o DataJud. Verificarei novamente na próxima hora.");
     return;
   }
 
-  // Se não houver nenhum processo na base
+  // Caso não existam processos para essa OAB
   if (pubs.length === 0) {
-    await bot.sendMessage(CHAT_ID, "🔍 *Verificação Horária:* Não foram localizados processos ou prazos em aberto para a OAB " + OAB_NUM + ".");
+    await bot.sendMessage(CHAT_ID, "🔍 *Verificação:* Nenhum processo ou prazo em aberto localizado para OAB " + OAB_NUM + ".");
     return;
   }
 
@@ -108,18 +119,17 @@ async function checkPublications() {
     }
   }
 
-  // Se houver processos na base, mas nenhum for "novo"
+  // Se a lista não estiver vazia, mas todos já foram vistos
   if (novosEnviados === 0) {
-    await bot.sendMessage(CHAT_ID, "✅ *Tudo em dia:* Nenhuma nova movimentação desde a última hora.");
+    await bot.sendMessage(CHAT_ID, "✅ *Tudo em dia:* Nenhuma movimentação nova para a OAB " + OAB_NUM + ".");
   }
 
   saveSeen(seen);
-  console.log(`Fim da verificação. Novas: ${novosEnviados}`);
 }
 
 // ─── COMANDOS ─────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, `🤖 *Monitor Jurídico Ativo*\n\nVerificando OAB *${OAB_NUM}/${OAB_UF}* de hora em hora.`);
+  bot.sendMessage(msg.chat.id, `🤖 *Monitor Jurídico Ativo*\n\nMonitorando OAB *${OAB_NUM}/${OAB_UF}*.\nVerificações automáticas de hora em hora.`);
 });
 
 bot.onText(/\/verificar/, async (msg) => {
@@ -127,9 +137,13 @@ bot.onText(/\/verificar/, async (msg) => {
   await checkPublications();
 });
 
-// ─── AGENDAMENTO (De hora em hora) ───────────────────────────────────────────
+bot.onText(/\/status/, (msg) => {
+  bot.sendMessage(msg.chat.id, `⚙️ *Configuração*\nOAB: ${OAB_NUM}\nUF: ${OAB_UF}\nFrequência: 1h/1h`);
+});
+
+// ─── AGENDAMENTO (Hora em Hora) ───────────────────────────────────────────────
 cron.schedule('0 * * * *', checkPublications);
 
-// ─── START ────────────────────────────────────────────────────────────────────
+// ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
 console.log('🤖 Bot iniciado com sucesso!');
 checkPublications(); 
