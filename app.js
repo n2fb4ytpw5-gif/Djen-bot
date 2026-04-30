@@ -6,15 +6,14 @@ const fs = require('fs');
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
-const OAB_NUM   = process.env.OAB_NUMBER;   // ex: "123456"
-const OAB_UF    = process.env.OAB_UF;       // ex: "SP"
+const OAB_NUM   = process.env.OAB_NUMBER;   // ex: "139219"
+const OAB_UF    = process.env.OAB_UF;       // ex: "RS"
 
 const SEEN_FILE = './seen_ids.json';
 
-// ─── BOT ──────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// ─── PERSISTÊNCIA DE IDs JÁ ENVIADOS ──────────────────────────────────────────
+// ─── PERSISTÊNCIA ─────────────────────────────────────────────────────────────
 function loadSeen() {
   try {
     return new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
@@ -27,72 +26,80 @@ function saveSeen(set) {
   fs.writeFileSync(SEEN_FILE, JSON.stringify([...set]));
 }
 
-// ─── CONSULTA DJEN ────────────────────────────────────────────────────────────
+// ─── CONSULTA DATAJUD (CNJ) ───────────────────────────────────────────────────
 async function fetchPublications() {
-  const today = new Date();
-  const dd    = String(today.getDate()).padStart(2, '0');
-  const mm    = String(today.getMonth() + 1).padStart(2, '0');
-  const yyyy  = today.getFullYear();
+  const url = `https://api-publica.datajud.cnj.jus.br/api_publica_tjrs/_search`;
 
-  const url = `https://www.jusbrasil.com.br/diarios/busca/?q=OAB+${OAB_NUM}+${OAB_UF}&o=1`;
-
-  // Tenta a API pública do CNJ primeiro
   try {
-    const cnj = await axios.get(
-      `https://djen.jus.br/comunicacoesProcessuais/pesquisa`,
+    const response = await axios.post(
+      url,
       {
-        params: {
-          numeroOAB:   OAB_NUM,
-          ufOAB:       OAB_UF,
-          dataInicio:  `${yyyy}-${mm}-${dd}`,
-          dataFim:     `${yyyy}-${mm}-${dd}`,
+        "query": {
+          "match": {
+            "advogado.numero_oab": OAB_NUM
+          }
+        }
+      },
+      {
+        headers: {
+          'Authorization': 'ApiKey c3VwZXJzZWNyZXRvOnN1cGVyc2VjcmV0bw==',
+          'Content-Type': 'application/json'
         },
-        timeout: 15000,
-        headers: { 'Accept': 'application/json' },
+        timeout: 15000
       }
     );
 
-    const items = cnj.data?.data || cnj.data?.publicacoes || cnj.data || [];
-    return Array.isArray(items) ? items : [];
+    const items = response.data?.hits?.hits || [];
+    return items.map(item => ({
+      id: item._id, // Usamos o ID único do DataJud
+      numeroProcesso: item._source.numeroProcesso,
+      data: item._source.dataHoraUltimaAtualizacao,
+      texto: item._source.classe?.nome || "Movimentação processual identificada no TJRS."
+    }));
   } catch (err) {
-    console.error('[DJEN] Erro na consulta:', err.message);
-    return [];
+    console.error('[DataJud] Erro na consulta:', err.message);
+    return null; // Retorna null para indicar erro de conexão
   }
 }
 
-// ─── FORMATA MENSAGEM ──────────────────────────────────────────────────────────
+// ─── FORMATAÇÃO ───────────────────────────────────────────────────────────────
 function formatMsg(pub) {
-  const num   = pub.numeroProcesso || pub.numero_processo || 'N/D';
-  const data  = pub.dataDisponibilizacao || pub.data || 'N/D';
-  const texto = pub.texto || pub.conteudo || pub.resumo || '(sem resumo)';
-  const trecho = texto.length > 600 ? texto.substring(0, 600) + '…' : texto;
+  const num = pub.numeroProcesso;
+  const data = new Date(pub.data).toLocaleString('pt-BR');
+  const texto = pub.texto;
 
   return (
-    `⚖️ *Nova publicação no DJEN*\n\n` +
+    `⚖️ *Nova publicação detectada*\n\n` +
     `📋 *Processo:* \`${num}\`\n` +
-    `📅 *Data:* ${data}\n\n` +
-    `📝 *Trecho:*\n${trecho}`
+    `📅 *Atualização:* ${data}\n\n` +
+    `📝 *Classe/Movimentação:*\n${texto}`
   );
 }
 
-// ─── VERIFICA PUBLICAÇÕES ──────────────────────────────────────────────────────
+// ─── LÓGICA DE VERIFICAÇÃO ────────────────────────────────────────────────────
 async function checkPublications() {
-  console.log(`[${new Date().toLocaleString('pt-BR')}] Verificando DJEN...`);
+  console.log(`[${new Date().toLocaleString('pt-BR')}] Iniciando verificação horária...`);
   const seen = loadSeen();
   const pubs = await fetchPublications();
 
-  if (pubs.length === 0) {
-    console.log('Nenhuma publicação encontrada hoje.');
+  // Se a API falhar (retornar null)
+  if (pubs === null) {
+    await bot.sendMessage(CHAT_ID, "⚠️ *Aviso:* Falha na conexão com o DataJud. Tentarei novamente na próxima hora.");
     return;
   }
 
-  let novos = 0;
-  for (const pub of pubs) {
-    const id = pub.id || pub.idPublicacao || pub.numeroProcesso || JSON.stringify(pub).slice(0, 80);
-    if (seen.has(id)) continue;
+  // Se não houver nenhum processo na base
+  if (pubs.length === 0) {
+    await bot.sendMessage(CHAT_ID, "🔍 *Verificação Horária:* Não foram localizados processos ou prazos em aberto para a OAB " + OAB_NUM + ".");
+    return;
+  }
 
-    seen.add(id);
-    novos++;
+  let novosEnviados = 0;
+  for (const pub of pubs) {
+    if (seen.has(pub.id)) continue;
+
+    seen.add(pub.id);
+    novosEnviados++;
 
     try {
       await bot.sendMessage(CHAT_ID, formatMsg(pub), { parse_mode: 'Markdown' });
@@ -101,47 +108,28 @@ async function checkPublications() {
     }
   }
 
+  // Se houver processos na base, mas nenhum for "novo"
+  if (novosEnviados === 0) {
+    await bot.sendMessage(CHAT_ID, "✅ *Tudo em dia:* Nenhuma nova movimentação desde a última hora.");
+  }
+
   saveSeen(seen);
-  console.log(`Novas publicações enviadas: ${novos}`);
+  console.log(`Fim da verificação. Novas: ${novosEnviados}`);
 }
 
-// ─── COMANDOS DO BOT ──────────────────────────────────────────────────────────
+// ─── COMANDOS ─────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    `👋 *Bot DJEN ativo!*\n\n` +
-    `Monitorando OAB *${OAB_NUM}/${OAB_UF}* 🔍\n\n` +
-    `Verificações automáticas: *dias úteis às 8h, 12h e 18h*\n\n` +
-    `Comandos:\n` +
-    `/verificar — checar agora\n` +
-    `/status — ver configuração`,
-    { parse_mode: 'Markdown' }
-  );
+  bot.sendMessage(msg.chat.id, `🤖 *Monitor Jurídico Ativo*\n\nVerificando OAB *${OAB_NUM}/${OAB_UF}* de hora em hora.`);
 });
 
 bot.onText(/\/verificar/, async (msg) => {
-  await bot.sendMessage(msg.chat.id, '🔍 Verificando publicações agora...');
+  await bot.sendMessage(msg.chat.id, '🔎 Iniciando busca manual...');
   await checkPublications();
-  await bot.sendMessage(msg.chat.id, '✅ Verificação concluída!');
 });
 
-bot.onText(/\/status/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    `⚙️ *Status do Bot*\n\n` +
-    `OAB: *${OAB_NUM}/${OAB_UF}*\n` +
-    `Chat ID: \`${CHAT_ID}\`\n` +
-    `Agendamento: dias úteis 8h, 12h e 18h`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-// ─── AGENDAMENTO (dias úteis, 3x ao dia) ─────────────────────────────────────
-// Seg-Sex às 08:00, 12:00 e 18:00 (horário de Brasília = UTC-3)
-cron.schedule('0 11 * * 1-5', checkPublications); // 08:00 BRT
-cron.schedule('0 15 * * 1-5', checkPublications); // 12:00 BRT
-cron.schedule('0 21 * * 1-5', checkPublications); // 18:00 BRT
+// ─── AGENDAMENTO (De hora em hora) ───────────────────────────────────────────
+cron.schedule('0 * * * *', checkPublications);
 
 // ─── START ────────────────────────────────────────────────────────────────────
-console.log('🤖 Bot DJEN iniciado!');
-console.log(`   OAB: ${OAB_NUM}/${OAB_UF}`);
-console.log(`   Chat ID: ${CHAT_ID}`);
-checkPublications(); // roda uma vez ao iniciar
+console.log('🤖 Bot iniciado com sucesso!');
+checkPublications(); 
